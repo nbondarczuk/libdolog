@@ -1,0 +1,378 @@
+///////////////////////////////////////////////////////////////////////////////
+//Copyright (c) 2014 Ericsson
+//
+//The copyright in this work is vested in Ericsson Telekommunikation GmbH
+//(hereafter "Ericsson"). The information contained in this work (either in whole
+//or in part) is confidential and must not be modified, reproduced, disclosed or
+//disseminated to others or used for purposes other than that for which it is
+//supplied, without the prior written permission of Ericsson. If this work or any
+//part hereof is furnished to a third party by virtue of a contract with that
+//party, use of this work by such party shall be governed by the express
+//contractual terms between Ericsson, which is party to that contract and the
+//said party.
+//
+//The information in this document is subject to change without notice and
+//should not be construed as a commitment by Ericsson. Ericsson assumes no
+//responsibility for any errors that may appear in this document. With the
+//appearance of a new version of this document all older versions become
+//invalid.
+//
+//All rights reserved.
+///////////////////////////////////////////////////////////////////////////////
+/*
+ * static char *SCCS_VERSION = "%I%";
+ */
+
+#include <string>
+#include <iostream>
+#include <map>
+#include <list>
+#include <stdexcept>  
+#include <algorithm>
+#include <sstream>
+#include <functional>
+
+#include <string.h>
+#include <oci.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sqlcpr.h>
+#include <sqlca.h>
+
+#include "DbCtrl.hpp"
+#include "DoLogDb.hpp"
+#include "DoLog.hpp"
+
+EXEC SQL INCLUDE SQLCA;
+EXEC SQL INCLUDE ORACA;
+EXEC ORACLE OPTION( ORACA=YES );
+EXEC ORACLE OPTION( RELEASE_CURSOR=NO );
+EXEC ORACLE OPTION( SELECT_ERROR=YES );
+EXEC ORACLE OPTION( SQLCHECK=SYNTAX );
+
+extern DoLog dl;    
+extern DbCtrl dc;
+
+typedef struct
+{
+    ub4 len;
+    unsigned char buf[MAX_XML_SIZE];
+} LONG_VARCHAR;
+
+EXEC SQL TYPE LONG_VARCHAR is long varchar(MAX_XML_SIZE);
+
+////////////////////////////////////////////////////////////////////////////////
+// DoLog::DbLongVarcharLoad
+////////////////////////////////////////////////////////////////////////////////
+
+bool
+DoLog::DbLongVarcharLoad(int seqno, int image_len)
+{
+    static int max_image_len = 0;
+    static unsigned char *image_buf = NULL;    
+    EXEC SQL BEGIN DECLARE SECTION;
+    VARCHAR ora_rowid[32];
+    char ora_status = 'P';
+    VARCHAR ora_moderrmsg[256];
+    LONG_VARCHAR *ora_lvr;
+    int ora_seqno;
+    EXEC SQL END DECLARE SECTION;
+
+    cout << "Fetching XML record: " << seqno << endl;   
+    
+    if (image_len > max_image_len)
+    {
+        if ((void *)image_buf != NULL)
+        {       
+            free(image_buf);
+        }        
+        image_buf = (unsigned char *)malloc(sizeof(ub4) + image_len);
+        if ((void *)image_buf == NULL)
+        {
+            return false;
+        }
+        max_image_len = image_len;            
+    }
+    ora_lvr = (LONG_VARCHAR *)image_buf;
+    ora_lvr->len = image_len;
+
+    ora_seqno = seqno;
+    
+    EXEC SQL
+        SELECT XML
+        INTO :ora_lvr
+        FROM DOLOG_ALL
+        WHERE SEQNO = :ora_seqno;
+    if (sqlca.sqlcode != 0)
+    {
+        cout << sqlca.sqlcode << endl;
+        return dc.sqlErrorHandler("DbLongVarcharLoad: SELECT FROM DOLOG_ALL ROWID"); 
+    }   
+    else
+    {
+        try {
+            dl.XmlParse(ora_lvr->buf, ora_lvr->len);
+        }
+        catch(...)
+        {
+            ora_status = 'E';
+        }
+    }
+    
+    EXEC SQL
+        UPDATE DOLOG_ALL
+        SET STATUS = :ora_status,
+        MODIFY_DATE = SYSDATE              
+        WHERE SEQNO = :ora_seqno;
+    if (sqlca.sqlcode != 0)
+    {
+        return dc.sqlErrorHandler("DbLongVarcharLoad: UPDATE DOLOG_ALL"); 
+    }   
+
+    return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// DoLog::DbLongVarcharInsert
+////////////////////////////////////////////////////////////////////////////////
+
+bool
+DoLog::DbLongVarcharInsert(string image, string digest)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    int bufsize;
+    long ora_seqno;
+    char ora_logtype = 'U';
+    char ora_status = 'C';        
+    VARCHAR ora_digest[256];
+    int ora_xmlsize;
+    LONG_VARCHAR *ora_lvr;
+    EXEC SQL END DECLARE SECTION;
+
+    cout << "Inserting XML record: " << digest << endl;   
+    
+    bufsize = image.length();
+    ora_lvr = (LONG_VARCHAR *)malloc(sizeof(ub4) + bufsize);
+    if (ora_lvr == NULL)
+    {
+        return false;
+    }
+    else
+    {
+        ora_lvr->len = bufsize;
+        memcpy((unsigned char *)ora_lvr->buf, image.c_str(), bufsize);
+    }
+    
+    ora_xmlsize = bufsize;
+    
+    bufsize = digest.length();    
+    ora_digest.len = bufsize;
+    memcpy((unsigned char *)ora_digest.arr, digest.c_str(), bufsize);
+    
+    EXEC SQL
+        SELECT DOLOG_ALL_SEQ.NEXTVAL
+        INTO :ora_seqno
+        FROM DUAL; 
+    if (sqlca.sqlcode != 0)
+    {
+        return dc.sqlErrorHandler("DbLongRawInsert: SELECT DOLOG_ALL_SEQ.NEXTVAL"); 
+    }
+    
+    EXEC SQL
+        INSERT INTO DOLOG_ALL
+        (
+            SEQNO,
+            LOGTYPE,
+            STATUS,
+            DIGEST,
+            ENTRY_DATE,
+            XMLSIZE,
+            XML
+        )
+        VALUES
+        (
+            :ora_seqno,
+            :ora_logtype,
+            :ora_status,
+            :ora_digest,
+            SYSDATE,
+            :ora_xmlsize,
+            :ora_lvr
+        );
+    if (sqlca.sqlcode != 0)
+    {
+        return dc.sqlErrorHandler("DbLongRawInsert: INSERT INTO DOLOG_ALL"); 
+    }
+    else
+    {
+        cout << "Inserted XML record: " << ora_seqno << endl;
+        cout << image << endl;
+    }
+    
+    EXEC SQL COMMIT;
+    if (sqlca.sqlcode != 0)
+    {
+        return dc.sqlErrorHandler("DbLongVarcharInsert: COMMIT");
+    }
+    
+    free(ora_lvr);
+    
+    return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// 
+////////////////////////////////////////////////////////////////////////////////
+
+int
+DoLog::DbSave()
+{    
+    bool ok;
+    int n = 0;
+
+    cout << "Saving XML log" << endl;
+    for(DoLogBatchIt it = m_dlt.begin(); it != m_dlt.end(); ++it)
+    {
+        stringstream ss;
+        DoLogBatch *batch = it->second;
+        
+        ss << "<UNDOLOG>\n";        
+        ss << "<BATCH>\n";        
+        ss << "<DIGEST>" << it->first << "</DIGEST>\n";
+        ss << "<KEY>\n";        
+        ss << batch->m_batch_k.Xml();
+        ss << "</KEY>\n";
+        ss << batch->XmlUndo();
+        ss << "</BATCH>\n";
+        ss << "</UNDOLOG>\n";        
+        ok = DbLongVarcharInsert(ss.str(), batch->m_digest);
+        if (!ok)
+        {
+            return -1;
+        }
+        else
+        {
+            n++;
+        }
+    }
+    
+    return n;
+} 
+
+////////////////////////////////////////////////////////////////////////////////
+// DoLog::DbLoad
+////////////////////////////////////////////////////////////////////////////////
+
+int
+DoLog::DbLoad()
+{
+    int n = 0;
+    bool ok;
+    
+    EXEC SQL BEGIN DECLARE SECTION;
+    VARCHAR ora_rowid[32];
+    VARCHAR ora_digest[256];
+    int ora_seqno;
+    int ora_xmlsize;    
+    char ora_status = 'C';        
+    EXEC SQL END DECLARE SECTION;
+
+    EXEC SQL
+        DECLARE xml_cursor CURSOR FOR 
+        SELECT SEQNO, DIGEST, XMLSIZE
+        FROM DOLOG_ALL
+        WHERE STATUS = :ora_status
+        FOR UPDATE;
+    if (sqlca.sqlcode != 0)
+    {
+        return dc.sqlErrorHandler("DoLog::DbLoad: DECLARE CURSOR"); 
+    }
+        
+    EXEC SQL OPEN xml_cursor;
+    if (sqlca.sqlcode != 0)
+    {
+        return dc.sqlErrorHandler("DoLog::DbLoad: OPEN CURSOR"); 
+    }
+
+    do {
+        EXEC SQL
+            FETCH xml_cursor
+            INTO :ora_seqno, :ora_digest, :ora_xmlsize;
+        if (    sqlca.sqlcode != 0 && sqlca.sqlcode != NOT_FOUND)
+        {            
+            return dc.sqlErrorHandler("DoLog::DbLoad: FETCH CURSOR"); 
+        }               
+        else if (sqlca.sqlcode != NOT_FOUND)
+        {
+            ok = DbLongVarcharLoad(ora_seqno, ora_xmlsize);
+            if (!ok)
+            {
+                return -1;
+            }
+            else
+            {
+                cout << "Loaded SEQNO: " << ora_seqno << endl;            
+                n++;
+            }
+        }
+        
+    } while (sqlca.sqlcode == 0);
+
+    EXEC SQL COMMIT;
+    if (sqlca.sqlcode != 0)
+    {
+        return dc.sqlErrorHandler("DoLog::DbLoad: COMMIT");
+    }
+
+    EXEC SQL CLOSE xml_cursor;
+    if (sqlca.sqlcode != 0)
+    {
+        return dc.sqlErrorHandler("DoLog::DbLoad: CLOSE CURSOR"); 
+    }
+        
+    return n;
+} 
+
+////////////////////////////////////////////////////////////////////////////////
+// DoLog::DbCreateDoLogTab
+////////////////////////////////////////////////////////////////////////////////
+
+bool
+DoLog::DbCreateDoLogTab()
+{
+    EXEC SQL DROP TABLE DOLOG_ALL;                
+    if (sqlca.sqlcode != 0 && sqlca.sqlcode != NON_EXISTENT)
+    {
+        return dc.sqlErrorHandler("DoLog::DbCreateDoLogTab: DROP TABLE UNDOLOG_ALL"); 
+    }   
+        
+    EXEC SQL
+        CREATE TABLE DOLOG_ALL
+        (
+            SEQNO NUMBER PRIMARY KEY,            
+            LOGTYPE CHAR(1),
+            STATUS CHAR(1),
+            DIGEST VARCHAR(256),
+            APP_NODE_ID NUMBER,
+            APP_PROGRAM_ID NUMBER,
+            USERNAME VARCHAR2(16),
+            ENTRY_DATE DATE,
+            MODIFY_DATE DATE,
+            ERRMSG VARCHAR(256),
+            XMLSIZE NUMBER,
+            XML LONG
+        );    
+    if (sqlca.sqlcode != 0)
+    {
+        return dc.sqlErrorHandler("DoLog::DbCreateDoLogTab: CREATE TABLE UNDOLOG_ALL"); 
+    }
+
+    return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// DoLog::SqlApply
+////////////////////////////////////////////////////////////////////////////////
+void
+DoLog::SqlApply()
+{}
